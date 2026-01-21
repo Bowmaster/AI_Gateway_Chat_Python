@@ -1,0 +1,11 @@
+# AI Gateway Chat Dependencies
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+prompt-toolkit>=3.0.40   # Advanced input handling with multiline, autocomplete
+rich>=13.0.0             # Rich console output, panels, tables
+requests>=2.28.0         # HTTP client for API communication
+pyyaml>=6.0              # Configuration file support
+
+# Optional: clipboard support (install separately if needed)
+pyperclip>=1.8.0         # Cross-platform clipboard support
