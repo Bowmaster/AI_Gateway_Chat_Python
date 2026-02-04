@@ -136,6 +136,9 @@ class ChatClient:
         self.working_directory: Optional[Path] = None  # Working directory for file ops
         self.input_session = self._create_input_session(history_file)
 
+        # Model tracking
+        self.current_model: Optional[str] = None
+
         # Conversation persistence
         self.conversation_manager = ConversationManager()
         self.current_conversation_id: Optional[str] = None
@@ -208,11 +211,39 @@ class ChatClient:
             return False
 
     def get_models_list(self) -> Optional[Dict]:
-        """Get list of available models from server."""
+        """Get list of available models from server (OpenAI /v1/models format)."""
         try:
-            response = requests.get(f"{self.server_url}/models", timeout=5)
+            response = requests.get(f"{self.server_url}/v1/models", timeout=5)
             if response.status_code == 200:
-                return response.json()
+                result = response.json()
+
+                # Normalize OpenAI model list format
+                models = result.get("data", [])
+                for model in models:
+                    # Map OpenAI 'id' to internal 'key'
+                    if "id" in model and "key" not in model:
+                        model["key"] = model["id"]
+                    # Provide defaults for extension fields that may not be present
+                    model.setdefault("name", model.get("key", "unknown"))
+                    model.setdefault("description", "")
+                    model.setdefault("context_length", 0)
+                    model.setdefault("vram_estimate", "N/A")
+                    model.setdefault("recommended", False)
+                    model.setdefault("is_current", False)
+                    model.setdefault("exists", True)
+
+                # Determine current model key from extension field or health endpoint
+                current_key = result.get("current_model_key", "")
+                if not current_key:
+                    current_key = self._get_current_model_key() or ""
+
+                # Mark current model
+                if current_key:
+                    for model in models:
+                        if model.get("key") == current_key:
+                            model["is_current"] = True
+
+                return {"models": models, "current_model_key": current_key}
             return None
         except requests.exceptions.RequestException:
             return None
@@ -238,6 +269,7 @@ class ChatClient:
             )
 
             if response.status_code == 200:
+                self.current_model = model_key
                 return response.json()
             else:
                 error = response.json().get("detail", "Unknown error")
@@ -276,19 +308,23 @@ class ChatClient:
         """Send a message to the server (batch mode)."""
         self.conversation_history.append({"role": "user", "content": message})
 
-        payload = {
-            "messages": self.conversation_history,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-
+        # Build messages with system prompt as system message (OpenAI format)
+        messages = list(self.conversation_history)
         effective_prompt = self._get_effective_system_prompt()
         if effective_prompt:
-            payload["system_prompt"] = effective_prompt
+            messages.insert(0, {"role": "system", "content": effective_prompt})
+
+        payload = {
+            "model": self._get_current_model_key() or "default",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
 
         try:
             response = requests.post(
-                f"{self.server_url}/chat", json=payload, timeout=300
+                f"{self.server_url}/v1/chat/completions", json=payload, timeout=300
             )
 
             if response.status_code == 200:
@@ -305,10 +341,27 @@ class ChatClient:
                         self.conversation_history.pop()
                         return None
                 else:
-                    self.conversation_history.append(
-                        {"role": "assistant", "content": result["response"]}
+                    # Parse OpenAI response format
+                    response_text = (
+                        result.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
                     )
-                    return result
+                    usage = result.get("usage", {})
+
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": response_text}
+                    )
+                    return {
+                        "response": response_text,
+                        "tokens_input": usage.get("prompt_tokens", 0),
+                        "tokens_generated": usage.get("completion_tokens", 0),
+                        "tokens_total": usage.get("total_tokens", 0),
+                        "generation_time": result.get("generation_time", 0),
+                        "tokens_per_second": result.get("tokens_per_second", 0),
+                        "device": result.get("device", "Unknown"),
+                        "tools_used": result.get("tools_used"),
+                    }
 
             elif response.status_code == 503:
                 error_detail = response.json().get("detail", "Server busy")
@@ -426,22 +479,26 @@ class ChatClient:
         """Send a message with streaming response."""
         self.conversation_history.append({"role": "user", "content": message})
 
-        payload = {
-            "messages": self.conversation_history,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-
+        # Build messages with system prompt as system message (OpenAI format)
+        messages = list(self.conversation_history)
         effective_prompt = self._get_effective_system_prompt()
         if effective_prompt:
-            payload["system_prompt"] = effective_prompt
+            messages.insert(0, {"role": "system", "content": effective_prompt})
+
+        payload = {
+            "model": self._get_current_model_key() or "default",
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
 
         try:
             accumulated_response = ""
             metadata = {}
 
             with requests.post(
-                f"{self.server_url}/chat/stream",
+                f"{self.server_url}/v1/chat/completions",
                 json=payload,
                 stream=True,
                 timeout=300,
@@ -514,11 +571,14 @@ class ChatClient:
                 {"role": "assistant", "content": accumulated_response}
             )
 
+            # Handle usage from either custom stream_end or OpenAI format
+            usage = metadata.get("usage", {})
+
             return {
                 "response": accumulated_response,
-                "tokens_input": metadata.get("tokens_input", 0),
-                "tokens_generated": metadata.get("tokens_generated", 0),
-                "tokens_total": metadata.get("tokens_total", 0),
+                "tokens_input": metadata.get("tokens_input", usage.get("prompt_tokens", 0)),
+                "tokens_generated": metadata.get("tokens_generated", usage.get("completion_tokens", 0)),
+                "tokens_total": metadata.get("tokens_total", usage.get("total_tokens", 0)),
                 "generation_time": metadata.get("generation_time", 0),
                 "tokens_per_second": metadata.get("tokens_per_second", 0),
                 "tools_used": metadata.get("tools_used"),
@@ -628,11 +688,16 @@ class ChatClient:
         console.print("[yellow]Conversation history cleared.[/yellow]")
 
     def _get_current_model_key(self) -> Optional[str]:
-        """Get the current model key from the server."""
+        """Get the current model key, using cache or server health endpoint."""
+        if self.current_model:
+            return self.current_model
         try:
             response = requests.get(f"{self.server_url}/health", timeout=5)
             if response.status_code == 200:
-                return response.json().get("model_key")
+                model_key = response.json().get("model_key")
+                if model_key:
+                    self.current_model = model_key
+                return model_key
         except requests.exceptions.RequestException:
             pass
         return None
@@ -1640,6 +1705,7 @@ class ChatClient:
             response = requests.get(f"{self.server_url}/health", timeout=5)
             if response.status_code == 200:
                 health = response.json()
+                self.current_model = health.get("model_key")
                 console.print(f"[cyan]Model: {health['model_key']}[/cyan]")
                 console.print(
                     f"[dim]GPU Layers: {health.get('n_gpu_layers', 'N/A')} | Device: {health['device']}[/dim]"
