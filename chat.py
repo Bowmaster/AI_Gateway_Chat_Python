@@ -196,16 +196,32 @@ class ChatClient:
             console.print(f"[red]{error_prefix} failed: {e}[/red]")
             return None
 
-    def check_server_health(self) -> bool:
-        """Check if server is healthy."""
+    def check_server_health(self) -> Dict:
+        """Check server health and return detailed status.
+
+        Returns:
+            Dict with keys: reachable, model_loaded, status,
+            crash_exit_code, crash_message
+        """
+        result = {
+            "reachable": False,
+            "model_loaded": False,
+            "status": "unknown",
+            "crash_exit_code": None,
+            "crash_message": None,
+        }
         try:
             response = requests.get(f"{self.server_url}/health", timeout=5)
             if response.status_code == 200:
                 health = response.json()
-                return health.get("model_loaded", False)
-            return False
+                result["reachable"] = True
+                result["model_loaded"] = health.get("model_loaded", False)
+                result["status"] = health.get("status", "unknown")
+                result["crash_exit_code"] = health.get("crash_exit_code")
+                result["crash_message"] = health.get("crash_message")
         except requests.exceptions.RequestException:
-            return False
+            pass
+        return result
 
     def get_models_list(self) -> Optional[Dict]:
         """Get list of available models from server."""
@@ -488,18 +504,20 @@ class ChatClient:
                                 metadata = chunk
                                 continue
 
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            if "content" in delta and delta["content"] is not None:
-                                token = delta["content"]
-                                accumulated_response += token
+                            choices = chunk.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                if "content" in delta and delta["content"] is not None:
+                                    token = delta["content"]
+                                    accumulated_response += token
 
-                                live.update(
-                                    Panel(
-                                        accumulated_response,
-                                        title="[bold green]Assistant[/bold green]",
-                                        border_style="green",
+                                    live.update(
+                                        Panel(
+                                            accumulated_response,
+                                            title="[bold green]Assistant[/bold green]",
+                                            border_style="green",
+                                        )
                                     )
-                                )
 
                         except json.JSONDecodeError:
                             continue
@@ -1629,9 +1647,25 @@ class ChatClient:
         )
 
         console.print("\n[yellow]Checking server...[/yellow]")
-        if not self.check_server_health():
-            console.print("[red]Server not responding or model not loaded![/red]")
-            console.print(f"[yellow]Ensure server is running at {self.server_url}[/yellow]")
+        health = self.check_server_health()
+
+        if not health["reachable"]:
+            console.print(f"[red]Cannot reach server at {self.server_url}[/red]")
+            console.print("[yellow]Ensure the server is running (python ai_server.py)[/yellow]")
+            return
+
+        if health["status"] == "crashed":
+            exit_code = health.get("crash_exit_code")
+            crash_msg = health.get("crash_message", "")
+            console.print(f"[red]Model process crashed (exit code: {exit_code})[/red]")
+            if crash_msg:
+                console.print(f"[red]  {crash_msg}[/red]")
+            console.print("[yellow]Try restarting the server or switching to a different model.[/yellow]")
+            return
+
+        if not health["model_loaded"] and health["status"] != "idle":
+            console.print("[red]Server is running but the model is not loaded.[/red]")
+            console.print("[yellow]Check server logs for startup errors.[/yellow]")
             return
 
         console.print("[green]Server ready![/green]\n")
