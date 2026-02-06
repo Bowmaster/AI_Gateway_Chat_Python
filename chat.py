@@ -22,6 +22,7 @@ from rich.live import Live
 from rich import box
 from pathlib import Path
 import json
+import re
 from datetime import datetime
 
 # prompt_toolkit imports
@@ -78,11 +79,39 @@ class SlashCommandCompleter(Completer):
             "off": "Disable tool calling",
         },
         "/stop-server": {"_desc": "Shutdown the server"},
+        "/temp": {
+            "_desc": "Get/set temperature (0.0-2.0)",
+            "default": "Reset to 0.7",
+        },
+        "/maxtokens": {
+            "_desc": "Get/set max tokens (1-131072)",
+            "default": "Reset to 8192",
+        },
         "/raw": {"_desc": "Toggle raw output mode (for copy/paste)"},
         "/copy": {"_desc": "Copy last response to clipboard"},
         "/cd": {"_desc": "Set working directory for file operations"},
         "/pwd": {"_desc": "Show current working directory"},
         "/ls": {"_desc": "List files in working directory"},
+        "/stats": {"_desc": "Show session statistics"},
+        "/tail": {"_desc": "Show last N messages (default: 6)"},
+        "/retry": {"_desc": "Retry/rephrase last message"},
+        "/code": {
+            "_desc": "Extract code blocks from last response",
+            "all": "Copy all code blocks",
+        },
+        "/search": {"_desc": "Search saved conversations"},
+        "/prompt": {
+            "_desc": "Manage system prompt templates",
+            "list": "List saved templates",
+            "save": "Save current prompt as template",
+            "load": "Load a saved template",
+            "show": "Display a template",
+            "delete": "Delete a template",
+        },
+        "/include": {
+            "_desc": "Include file content in next message",
+            "clear": "Clear pending file inclusion",
+        },
         "/save": {"_desc": "Save/name current conversation"},
         "/new": {"_desc": "Start a new conversation"},
         "/conversations": {"_desc": "List saved conversations"},
@@ -133,6 +162,21 @@ class ChatClient:
         self.streaming_enabled: bool = True
         self.raw_output: bool = False
         self.last_response: str = ""
+        self.temperature: float = 0.7
+        self.max_tokens: int = 8192
+        self.pending_include: Optional[str] = None  # File content for /include
+
+        # Session statistics
+        self.session_stats = {
+            "messages_sent": 0,
+            "total_tokens_in": 0,
+            "total_tokens_out": 0,
+            "total_generation_time": 0.0,
+            "session_start": datetime.now(),
+        }
+
+        # Context warning thresholds already shown (don't nag)
+        self._context_warnings_shown: set = set()
         self.working_directory: Optional[Path] = None  # Working directory for file ops
         self.input_session = self._create_input_session(history_file)
 
@@ -319,9 +363,11 @@ class ChatClient:
         return "\n".join(parts) if parts else None
 
     def send_message(
-        self, message: str, temperature: float = 0.7, max_tokens: int = 8192
+        self, message: str, temperature: float = None, max_tokens: int = None
     ) -> Optional[Dict]:
         """Send a message to the server (batch mode)."""
+        temperature = temperature if temperature is not None else self.temperature
+        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         self.conversation_history.append({"role": "user", "content": message})
 
         # Build messages with system prompt as system message (OpenAI format)
@@ -490,9 +536,11 @@ class ChatClient:
             return None
 
     def send_message_streaming(
-        self, message: str, temperature: float = 0.7, max_tokens: int = 8192
+        self, message: str, temperature: float = None, max_tokens: int = None
     ) -> Optional[Dict]:
         """Send a message with streaming response."""
+        temperature = temperature if temperature is not None else self.temperature
+        max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         self.conversation_history.append({"role": "user", "content": message})
 
         # Build messages with system prompt as system message (OpenAI format)
@@ -705,6 +753,78 @@ class ChatClient:
         self.current_conversation_title = None
         console.print("[yellow]Conversation history cleared.[/yellow]")
 
+    def _update_session_stats(self, result: Dict):
+        """Accumulate session statistics from a message result."""
+        self.session_stats["messages_sent"] += 1
+        self.session_stats["total_tokens_in"] += result.get("tokens_input", 0)
+        self.session_stats["total_tokens_out"] += result.get("tokens_generated", 0)
+        self.session_stats["total_generation_time"] += result.get("generation_time", 0)
+
+    def _show_stats(self):
+        """Display session statistics."""
+        stats = self.session_stats
+        elapsed = (datetime.now() - stats["session_start"]).total_seconds()
+
+        hours, remainder = divmod(int(elapsed), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours > 0:
+            elapsed_str = f"{hours}h {minutes}m {seconds}s"
+        elif minutes > 0:
+            elapsed_str = f"{minutes}m {seconds}s"
+        else:
+            elapsed_str = f"{seconds}s"
+
+        total_tokens = stats["total_tokens_in"] + stats["total_tokens_out"]
+        avg_speed = (
+            stats["total_tokens_out"] / stats["total_generation_time"]
+            if stats["total_generation_time"] > 0
+            else 0
+        )
+
+        table = Table(title="Session Statistics", box=box.ROUNDED)
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", justify="right", style="white")
+        table.add_row("Session Duration", elapsed_str)
+        table.add_row("Messages Sent", str(stats["messages_sent"]))
+        table.add_row("Tokens In (prompt)", f"{stats['total_tokens_in']:,}")
+        table.add_row("Tokens Out (generated)", f"{stats['total_tokens_out']:,}")
+        table.add_row("Total Tokens", f"{total_tokens:,}")
+        table.add_row("Total Generation Time", f"{stats['total_generation_time']:.2f}s")
+        table.add_row("Avg Generation Speed", f"{avg_speed:.1f} tok/s")
+        table.add_row("Conversation Messages", str(len(self.conversation_history)))
+        table.add_row("Temperature", str(self.temperature))
+        table.add_row("Max Tokens", str(self.max_tokens))
+        console.print(table)
+
+    def _check_context_warning(self):
+        """Check context usage and warn if approaching limits."""
+        try:
+            response = requests.get(f"{self.server_url}/health", timeout=3)
+            if response.status_code == 200:
+                health = response.json()
+                percent = health.get("context_used_percent", 0)
+
+                if percent >= 95 and 95 not in self._context_warnings_shown:
+                    self._context_warnings_shown.add(95)
+                    console.print(
+                        f"[red bold]Context nearly full ({percent:.0f}%)! "
+                        f"Start a new conversation with /new.[/red bold]"
+                    )
+                elif percent >= 85 and 85 not in self._context_warnings_shown:
+                    self._context_warnings_shown.add(85)
+                    console.print(
+                        f"[red]Context {percent:.0f}% full! "
+                        f"Responses may be truncated. Use /new or /reset.[/red]"
+                    )
+                elif percent >= 70 and 70 not in self._context_warnings_shown:
+                    self._context_warnings_shown.add(70)
+                    console.print(
+                        f"[yellow]Context {percent:.0f}% full. "
+                        f"Consider /new to start fresh.[/yellow]"
+                    )
+        except requests.exceptions.RequestException:
+            pass
+
     def _get_current_model_key(self) -> Optional[str]:
         """Get the current model key, using cache or server health endpoint."""
         if self.current_model:
@@ -736,6 +856,472 @@ class ChatClient:
             )
         except Exception as e:
             console.print(f"[dim red]Auto-save failed: {e}[/dim red]")
+
+    def _handle_tail_command(self, value: Optional[str]):
+        """Handle the /tail command — show last N messages."""
+        if not self.conversation_history:
+            console.print("[yellow]No conversation history.[/yellow]")
+            return
+
+        count = 6  # Default: 3 exchanges
+        if value is not None:
+            try:
+                count = int(value)
+                if count < 1:
+                    count = 1
+                elif count > 50:
+                    count = 50
+            except ValueError:
+                console.print("[red]Usage: /tail [number][/red]")
+                return
+
+        messages = self.conversation_history[-count:]
+        start_idx = len(self.conversation_history) - len(messages) + 1
+
+        console.print(f"\n[bold]Last {len(messages)} messages:[/bold]")
+        for i, msg in enumerate(messages):
+            idx = start_idx + i
+            role = msg["role"]
+            content = msg["content"]
+            if len(content) > 300:
+                content = content[:300] + "..."
+
+            if role == "user":
+                console.print(f"  [dim]#{idx}[/dim] [blue]You:[/blue] {content}")
+            else:
+                console.print(f"  [dim]#{idx}[/dim] [green]Assistant:[/green] {content}")
+        console.print()
+
+    def _handle_retry_command(self, value: Optional[str]):
+        """Handle the /retry command — re-send or rephrase last message."""
+        # Need at least one user message + one assistant response
+        if len(self.conversation_history) < 2:
+            console.print("[yellow]Not enough conversation history to retry.[/yellow]")
+            return
+
+        # Find last user-assistant pair
+        last_assistant = self.conversation_history[-1]
+        last_user = self.conversation_history[-2]
+
+        if last_assistant["role"] != "assistant" or last_user["role"] != "user":
+            console.print("[yellow]Last two messages are not a user-assistant pair.[/yellow]")
+            return
+
+        # Save for potential restore on failure
+        saved_user = last_user.copy()
+        saved_assistant = last_assistant.copy()
+
+        # Pop the last exchange
+        self.conversation_history.pop()  # assistant
+        self.conversation_history.pop()  # user
+
+        # Determine the message to send
+        new_message = value.strip() if value else saved_user["content"]
+
+        console.print(f"[dim]Retrying{'  with new message' if value else ''}...[/dim]")
+
+        if self.streaming_enabled:
+            result = self.send_message_streaming(new_message)
+        else:
+            result = self.send_message(new_message)
+
+        if result:
+            if not self.streaming_enabled:
+                self.last_response = result["response"]
+                self._display_response(result["response"])
+
+            console.print(
+                f"[dim]({result['tokens_input']} in -> {result['tokens_generated']} out -> "
+                f"{result['tokens_total']} total | "
+                f"{result['generation_time']:.2f}s @ {result['tokens_per_second']:.1f} tok/s | {result['device']})[/dim]"
+            )
+            self._update_session_stats(result)
+            self._check_context_warning()
+            self._auto_save_conversation()
+        else:
+            # Restore the original exchange on failure
+            self.conversation_history.append(saved_user)
+            self.conversation_history.append(saved_assistant)
+            console.print("[yellow]Retry failed. Original exchange restored.[/yellow]")
+
+    def _handle_code_command(self, value: Optional[str]):
+        """Handle the /code command — extract code blocks from last response."""
+        if not self.last_response:
+            console.print("[yellow]No response to extract code from.[/yellow]")
+            return
+
+        # Extract fenced code blocks: ```lang\n...\n```
+        blocks = re.findall(r'```(\w*)\n(.*?)```', self.last_response, re.DOTALL)
+
+        if not blocks:
+            console.print("[yellow]No code blocks found in last response.[/yellow]")
+            return
+
+        if value is None:
+            # List all code blocks
+            console.print(f"\n[bold]Found {len(blocks)} code block(s):[/bold]")
+            for i, (lang, code) in enumerate(blocks, 1):
+                lang_label = f" ({lang})" if lang else ""
+                first_line = code.strip().split("\n")[0][:60]
+                lines = code.strip().count("\n") + 1
+                console.print(
+                    f"  [cyan]#{i}[/cyan]{lang_label} [{lines} lines]: "
+                    f"[dim]{first_line}[/dim]"
+                )
+            console.print("\n[dim]Use /code <n> to copy a block, or /code all[/dim]")
+            return
+
+        # Determine which blocks to copy
+        if value.lower() == "all":
+            text = "\n\n".join(code.strip() for _, code in blocks)
+        else:
+            try:
+                idx = int(value)
+                if 1 <= idx <= len(blocks):
+                    text = blocks[idx - 1][1].strip()
+                else:
+                    console.print(f"[red]Block number must be 1-{len(blocks)}[/red]")
+                    return
+            except ValueError:
+                console.print("[red]Usage: /code [number|all][/red]")
+                return
+
+        # Copy to clipboard or print
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+            console.print("[green]Code block copied to clipboard![/green]")
+        except ImportError:
+            console.print("[yellow]pyperclip not installed. Here's the code:[/yellow]\n")
+            console.print(text)
+            console.print(
+                "\n[dim]Install pyperclip for clipboard support: pip install pyperclip[/dim]"
+            )
+
+    def _handle_search_command(self, term: str):
+        """Handle the /search command — search across saved conversations."""
+        term_lower = term.strip().strip('"').strip("'").lower()
+        if not term_lower:
+            console.print("[yellow]Usage: /search <term>[/yellow]")
+            return
+
+        storage_dir = self.conversation_manager.storage_dir
+        results = []
+        files_scanned = 0
+        max_results = 20
+        max_file_size = 10 * 1024 * 1024  # 10MB safety limit
+
+        for conv_path in storage_dir.glob("*.json"):
+            if conv_path.name == "index.json":
+                continue
+
+            # Skip oversized files
+            try:
+                if conv_path.stat().st_size > max_file_size:
+                    continue
+            except OSError:
+                continue
+
+            files_scanned += 1
+
+            try:
+                with open(conv_path, "r", encoding="utf-8") as f:
+                    conv = json.load(f)
+
+                title = conv.get("title", conv_path.stem)
+                conv_id = conv.get("id", conv_path.stem)
+                matches_in_conv = []
+
+                for i, msg in enumerate(conv.get("messages", [])):
+                    content = msg.get("content", "")
+                    if term_lower in content.lower():
+                        # Extract a context snippet around the match
+                        lower_content = content.lower()
+                        pos = lower_content.find(term_lower)
+                        start = max(0, pos - 40)
+                        end = min(len(content), pos + len(term_lower) + 40)
+                        snippet = content[start:end].replace("\n", " ")
+                        if start > 0:
+                            snippet = "..." + snippet
+                        if end < len(content):
+                            snippet = snippet + "..."
+                        matches_in_conv.append({
+                            "role": msg.get("role", "?"),
+                            "msg_idx": i + 1,
+                            "snippet": snippet,
+                        })
+
+                if matches_in_conv:
+                    results.append({
+                        "title": title,
+                        "id": conv_id,
+                        "matches": matches_in_conv,
+                    })
+
+                if len(results) >= max_results:
+                    break
+
+            except (json.JSONDecodeError, IOError, KeyError):
+                continue
+
+        if not results:
+            console.print(f"[yellow]No matches for '{term}' in {files_scanned} conversations.[/yellow]")
+            return
+
+        total_matches = sum(len(r["matches"]) for r in results)
+        console.print(
+            f"\n[bold]Found {total_matches} match(es) across "
+            f"{len(results)} conversation(s):[/bold]\n"
+        )
+
+        for r in results:
+            console.print(f"  [cyan]{r['title']}[/cyan] [dim]({r['id']})[/dim]")
+            for m in r["matches"][:3]:  # Show max 3 snippets per conversation
+                role_label = "[blue]You[/blue]" if m["role"] == "user" else "[green]Asst[/green]"
+                console.print(f"    #{m['msg_idx']} {role_label}: [dim]{m['snippet']}[/dim]")
+            if len(r["matches"]) > 3:
+                console.print(f"    [dim]... and {len(r['matches']) - 3} more matches[/dim]")
+        console.print()
+
+    def _handle_prompt_command(self, value: Optional[str]):
+        """Handle the /prompt command — manage system prompt templates."""
+        templates_dir = Path.home() / ".prompt_templates"
+
+        if value is None:
+            console.print("[yellow]Usage: /prompt <list|save|load|show|delete> [name][/yellow]")
+            return
+
+        parts = value.strip().split(maxsplit=1)
+        subcmd = parts[0].lower()
+        name = parts[1].strip() if len(parts) > 1 else None
+
+        if subcmd == "list":
+            if not templates_dir.exists():
+                console.print("[yellow]No prompt templates saved yet.[/yellow]")
+                return
+            templates = sorted(templates_dir.glob("*.txt"))
+            if not templates:
+                console.print("[yellow]No prompt templates saved yet.[/yellow]")
+                return
+            console.print("\n[bold]Saved prompt templates:[/bold]")
+            for t in templates:
+                size = t.stat().st_size
+                console.print(f"  [cyan]{t.stem}[/cyan] [dim]({size} bytes)[/dim]")
+            console.print(f"\n[dim]Use /prompt load <name> to activate[/dim]")
+
+        elif subcmd == "save":
+            if not name:
+                console.print("[yellow]Usage: /prompt save <name>[/yellow]")
+                return
+            if not self.system_prompt:
+                console.print("[yellow]No system prompt set. Use /system <prompt> first.[/yellow]")
+                return
+
+            slug = self.conversation_manager._slugify(name)
+            if not slug:
+                console.print("[red]Invalid template name.[/red]")
+                return
+
+            templates_dir.mkdir(parents=True, exist_ok=True)
+            template_path = templates_dir / f"{slug}.txt"
+
+            # Verify path confinement
+            resolved = template_path.resolve()
+            if not resolved.parent == templates_dir.resolve():
+                console.print("[red]Invalid template path.[/red]")
+                return
+
+            # Size limit: 100KB
+            if len(self.system_prompt.encode("utf-8")) > 100 * 1024:
+                console.print("[red]System prompt too large for template (>100KB).[/red]")
+                return
+
+            template_path.write_text(self.system_prompt, encoding="utf-8")
+            console.print(f"[green]Template saved: {slug}[/green]")
+
+        elif subcmd == "load":
+            if not name:
+                console.print("[yellow]Usage: /prompt load <name>[/yellow]")
+                return
+
+            slug = self.conversation_manager._slugify(name)
+            template_path = templates_dir / f"{slug}.txt"
+            resolved = template_path.resolve()
+
+            if not templates_dir.exists() or not resolved.parent == templates_dir.resolve():
+                console.print(f"[red]Template not found: {name}[/red]")
+                return
+            if not template_path.exists():
+                console.print(f"[red]Template not found: {slug}[/red]")
+                return
+
+            content = template_path.read_text(encoding="utf-8")
+            self.system_prompt = content
+            console.print(f"[green]Loaded template '{slug}' as system prompt.[/green]")
+            preview = content[:100] + ("..." if len(content) > 100 else "")
+            console.print(f"[dim]{preview}[/dim]")
+
+        elif subcmd == "show":
+            if not name:
+                console.print("[yellow]Usage: /prompt show <name>[/yellow]")
+                return
+
+            slug = self.conversation_manager._slugify(name)
+            template_path = templates_dir / f"{slug}.txt"
+            resolved = template_path.resolve()
+
+            if not templates_dir.exists() or not resolved.parent == templates_dir.resolve():
+                console.print(f"[red]Template not found: {name}[/red]")
+                return
+            if not template_path.exists():
+                console.print(f"[red]Template not found: {slug}[/red]")
+                return
+
+            content = template_path.read_text(encoding="utf-8")
+            console.print(
+                Panel(content, title=f"Template: {slug}", border_style="cyan")
+            )
+
+        elif subcmd == "delete":
+            if not name:
+                console.print("[yellow]Usage: /prompt delete <name>[/yellow]")
+                return
+
+            slug = self.conversation_manager._slugify(name)
+            template_path = templates_dir / f"{slug}.txt"
+            resolved = template_path.resolve()
+
+            if not templates_dir.exists() or not resolved.parent == templates_dir.resolve():
+                console.print(f"[red]Template not found: {name}[/red]")
+                return
+            if not template_path.exists():
+                console.print(f"[red]Template not found: {slug}[/red]")
+                return
+
+            confirm = Prompt.ask(
+                f"[yellow]Delete template '{slug}'?[/yellow]",
+                choices=["y", "n"],
+                default="n",
+                console=console,
+            )
+            if confirm.lower() == "y":
+                template_path.unlink()
+                console.print(f"[green]Deleted template: {slug}[/green]")
+            else:
+                console.print("[yellow]Deletion cancelled.[/yellow]")
+
+        else:
+            console.print("[yellow]Usage: /prompt <list|save|load|show|delete> [name][/yellow]")
+
+    def _handle_include_command(self, value: Optional[str]):
+        """Handle the /include command — include file content in next message."""
+        if value is None:
+            if self.pending_include:
+                lines = self.pending_include.count("\n") + 1
+                console.print(
+                    f"[cyan]Pending include: {lines} lines queued for next message.[/cyan]"
+                )
+                console.print("[dim]Use /include clear to remove.[/dim]")
+            else:
+                console.print("[yellow]Usage: /include <filepath>[/yellow]")
+                console.print("[dim]Includes file content as context in your next message.[/dim]")
+            return
+
+        if value.lower() == "clear":
+            self.pending_include = None
+            console.print("[green]Pending file inclusion cleared.[/green]")
+            return
+
+        # Resolve the path
+        file_path = Path(value).expanduser()
+        if not file_path.is_absolute():
+            base = self.working_directory or Path.cwd()
+            file_path = (base / file_path).resolve()
+        else:
+            file_path = file_path.resolve()
+
+        # Path confinement: if working directory is set, enforce boundary
+        if self.working_directory:
+            wd_resolved = self.working_directory.resolve()
+            try:
+                file_path.relative_to(wd_resolved)
+            except ValueError:
+                console.print(
+                    f"[red]Access denied: path is outside working directory ({wd_resolved})[/red]"
+                )
+                console.print("[dim]Use /cd to change working directory or use an absolute path with no working directory set.[/dim]")
+                return
+
+        if not file_path.exists():
+            console.print(f"[red]File not found: {file_path}[/red]")
+            return
+
+        if not file_path.is_file():
+            console.print(f"[red]Not a file: {file_path}[/red]")
+            return
+
+        # Size limit: 500KB
+        try:
+            file_size = file_path.stat().st_size
+        except OSError as e:
+            console.print(f"[red]Cannot access file: {e}[/red]")
+            return
+
+        if file_size > 500 * 1024:
+            size_kb = file_size / 1024
+            console.print(
+                f"[red]File too large ({size_kb:.0f}KB). Maximum is 500KB.[/red]"
+            )
+            return
+
+        if file_size == 0:
+            console.print("[yellow]File is empty.[/yellow]")
+            return
+
+        # Binary detection: read first 8192 bytes and check for null bytes
+        try:
+            with open(file_path, "rb") as f:
+                sample = f.read(8192)
+            if b"\x00" in sample:
+                console.print("[red]Binary file detected. Only text files can be included.[/red]")
+                return
+        except OSError as e:
+            console.print(f"[red]Cannot read file: {e}[/red]")
+            return
+
+        # Read file content
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            console.print(f"[red]Error reading file: {e}[/red]")
+            return
+
+        # Sensitive file warning
+        sensitive_patterns = [".env", "credentials", "secret", "password", ".key", ".pem", "token"]
+        filename_lower = file_path.name.lower()
+        for pattern in sensitive_patterns:
+            if pattern in filename_lower:
+                console.print(
+                    f"[yellow]Warning: '{file_path.name}' may contain sensitive data. "
+                    f"It will be sent to the AI server.[/yellow]"
+                )
+                confirm = Prompt.ask(
+                    "[yellow]Continue?[/yellow]",
+                    choices=["y", "n"],
+                    default="n",
+                    console=console,
+                )
+                if confirm.lower() != "y":
+                    console.print("[yellow]Inclusion cancelled.[/yellow]")
+                    return
+                break
+
+        lines = content.count("\n") + 1
+        self.pending_include = f"[File: {file_path.name}]\n```\n{content}\n```"
+        console.print(
+            f"[green]Included: {file_path.name} ({lines} lines, {file_size:,} bytes)[/green]"
+        )
+        console.print("[dim]Content will be prepended to your next message.[/dim]")
 
     def _prompt_for_title(self) -> Optional[str]:
         """Prompt user for a conversation title."""
@@ -1277,6 +1863,42 @@ class ChatClient:
                 console.print("[red]Usage: /stream [on|off][/red]")
             return True
 
+        elif cmd == "temp":
+            if value is None:
+                console.print(f"[cyan]Temperature: {self.temperature}[/cyan]")
+            elif value.lower() in ["default", "reset"]:
+                self.temperature = 0.7
+                console.print("[green]Temperature reset to 0.7[/green]")
+            else:
+                try:
+                    temp = float(value)
+                    if 0.0 <= temp <= 2.0:
+                        self.temperature = temp
+                        console.print(f"[green]Temperature set to {self.temperature}[/green]")
+                    else:
+                        console.print("[red]Temperature must be between 0.0 and 2.0[/red]")
+                except ValueError:
+                    console.print("[red]Invalid temperature. Use a number between 0.0 and 2.0[/red]")
+            return True
+
+        elif cmd == "maxtokens":
+            if value is None:
+                console.print(f"[cyan]Max tokens: {self.max_tokens}[/cyan]")
+            elif value.lower() in ["default", "reset"]:
+                self.max_tokens = 8192
+                console.print("[green]Max tokens reset to 8192[/green]")
+            else:
+                try:
+                    tokens = int(value)
+                    if 1 <= tokens <= 131072:
+                        self.max_tokens = tokens
+                        console.print(f"[green]Max tokens set to {self.max_tokens}[/green]")
+                    else:
+                        console.print("[red]Max tokens must be between 1 and 131072[/red]")
+                except ValueError:
+                    console.print("[red]Invalid value. Use a positive integer.[/red]")
+            return True
+
         elif cmd == "raw":
             self.raw_output = not self.raw_output
             if self.raw_output:
@@ -1308,6 +1930,37 @@ class ChatClient:
                     console.print(
                         "\n[dim]Install pyperclip for clipboard support: pip install pyperclip[/dim]"
                     )
+            return True
+
+        elif cmd == "stats":
+            self._show_stats()
+            return True
+
+        elif cmd == "tail":
+            self._handle_tail_command(value)
+            return True
+
+        elif cmd == "retry":
+            self._handle_retry_command(value)
+            return True
+
+        elif cmd == "code":
+            self._handle_code_command(value)
+            return True
+
+        elif cmd == "search":
+            if value is None:
+                console.print("[yellow]Usage: /search <term>[/yellow]")
+            else:
+                self._handle_search_command(value)
+            return True
+
+        elif cmd == "prompt":
+            self._handle_prompt_command(value)
+            return True
+
+        elif cmd == "include":
+            self._handle_include_command(value)
             return True
 
         elif cmd == "cd":
@@ -1569,6 +2222,17 @@ class ChatClient:
   /raw            Toggle raw output (for copy/paste)
   /copy           Copy last response to clipboard
 
+[bold cyan]Parameters:[/bold cyan]
+  /temp [value]   Get/set temperature (0.0-2.0, default: 0.7)
+  /maxtokens [n]  Get/set max tokens (1-131072, default: 8192)
+
+[bold cyan]Conversation Tools:[/bold cyan]
+  /stats          Show session statistics
+  /tail [n]       Show last N messages (default: 6)
+  /retry [msg]    Re-send last message or send a new one
+  /code [n|all]   Extract code blocks from last response
+  /search <term>  Search across saved conversations
+
 [bold cyan]Conversations:[/bold cyan]
   /save [title]   Save/name current conversation
   /new [title]    Start a new conversation
@@ -1576,7 +2240,16 @@ class ChatClient:
   /resume <id>    Resume a saved conversation
   /delete <id>    Delete a saved conversation
 
-[bold cyan]Working Directory:[/bold cyan]
+[bold cyan]Prompt Templates:[/bold cyan]
+  /prompt list    List saved templates
+  /prompt save    Save current system prompt as template
+  /prompt load    Load a template as system prompt
+  /prompt show    Display a template
+  /prompt delete  Delete a template
+
+[bold cyan]File Context:[/bold cyan]
+  /include <path> Include file content in next message
+  /include clear  Clear pending inclusion
   /cd <path>      Set working directory for file operations
   /cd             Show current working directory
   /pwd            Show current working directory
@@ -1636,7 +2309,12 @@ class ChatClient:
   Custom System Prompt: {'Yes' if self.system_prompt else 'No'}
   Streaming: {'Enabled' if self.streaming_enabled else 'Disabled'}
   Raw Output: {'Enabled' if self.raw_output else 'Disabled'}
+  Temperature: {self.temperature}
+  Max Tokens: {self.max_tokens}
   Working Directory: {self.working_directory or 'Not set'}
+  Pending Include: {'Yes' if self.pending_include else 'No'}
+  Session Messages Sent: {self.session_stats['messages_sent']}
+  Session Tokens: {self.session_stats['total_tokens_in'] + self.session_stats['total_tokens_out']:,}
 """
                 console.print(Panel(status_text, title="Status", border_style="cyan"))
             else:
@@ -1770,6 +2448,11 @@ class ChatClient:
                         break
                     continue
 
+                # Prepend pending file inclusion if set
+                if self.pending_include:
+                    user_input = f"{self.pending_include}\n\n{user_input}"
+                    self.pending_include = None
+
                 if self.streaming_enabled:
                     console.print("\n[dim]Streaming...[/dim]")
                     result = self.send_message_streaming(user_input)
@@ -1786,7 +2469,8 @@ class ChatClient:
                             f"{result['generation_time']:.2f}s @ {result['tokens_per_second']:.1f} tok/s | {result['device']})[/dim]"
                         )
 
-                        # Auto-save if conversation has a title
+                        self._update_session_stats(result)
+                        self._check_context_warning()
                         self._auto_save_conversation()
                 else:
                     console.print("\n[dim]Generating...[/dim]")
@@ -1807,7 +2491,8 @@ class ChatClient:
                             f"{result['generation_time']:.2f}s @ {result['tokens_per_second']:.1f} tok/s | {result['device']})[/dim]"
                         )
 
-                        # Auto-save if conversation has a title
+                        self._update_session_stats(result)
+                        self._check_context_warning()
                         self._auto_save_conversation()
 
             except KeyboardInterrupt:
